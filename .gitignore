@@ -1,0 +1,113 @@
+# Environment variables
+.env
+.env.local
+.env.production
+.env.test
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+.venv/
+env.bak/
+venv.bak/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Database
+*.db
+*.sqlite3
+chroma_db/
+faiss_index/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Documentation builds
+docs/_build/
+Documentation/*.pdf
+Documentation/*.aux
+Documentation/*.fdb_latexmk
+Documentation/*.fls
+Documentation/*.log
+Documentation/*.out
+Documentation/*.toc
+Documentation/*.synctex.gz
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# pytest
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.temp
+temp/
+tmp/
+
+# Large files
+*.pdf
+*.docx
+*.doc
+documents/
+!documents/sample_document.txt
+
+# Test files
+test_github_search.py
+github_search_fix.py
+test_*.py
+*_test.py
+
+# Cursor and development files
+.cursorignore
+.cursor/
+
+# Project updates and notes
+UPDATES.md
+updates.md
+NOTES.md
+notes.md
+
+# Project specific
+vector_store/ 
