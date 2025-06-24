@@ -25,6 +25,7 @@ from typing import List, Dict, Any, Optional, Union
 from datetime import datetime, timezone
 from enum import Enum
 from urllib.parse import quote
+import base64
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -52,6 +53,251 @@ class GitHubSearchResult(BaseModel):
     created_at: Optional[str] = Field(None, description="Creation date")
     updated_at: Optional[str] = Field(None, description="Last update date")
     metadata: Dict[str, Any] = Field(default_factory=dict, description="Additional metadata")
+
+
+class GitHubContentFetcher:
+    """Fetches actual content from GitHub files and repositories."""
+    
+    def __init__(self, github_token: Optional[str] = None):
+        """Initialize content fetcher."""
+        self.github_token = github_token or os.getenv("GITHUB_TOKEN")
+        self.base_url = "https://api.github.com"
+        self.headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "RAG-System-GitHub-Search/1.0"
+        }
+        
+        if self.github_token:
+            self.headers["Authorization"] = f"token {self.github_token}"
+    
+    async def fetch_file_content(self, owner: str, repo: str, path: str, ref: str = "main") -> Optional[str]:
+        """Fetch content of a specific file from GitHub repository."""
+        try:
+            async with aiohttp.ClientSession() as session:
+                url = f"{self.base_url}/repos/{owner}/{repo}/contents/{path}"
+                params = {"ref": ref}
+                
+                async with session.get(url, headers=self.headers, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        
+                        # GitHub returns base64 encoded content
+                        if data.get("encoding") == "base64":
+                            content = base64.b64decode(data["content"]).decode('utf-8')
+                            return content
+                        else:
+                            return data.get("content", "")
+                    else:
+                        print(f"❌ Failed to fetch content: HTTP {response.status}")
+                        return None
+        except Exception as e:
+            print(f"❌ Error fetching content: {str(e)}")
+            return None
+    
+    def extract_repo_info_from_url(self, url: str) -> Optional[Dict[str, str]]:
+        """Extract owner, repo, and path from GitHub URL."""
+        try:
+            # Handle different GitHub URL formats
+            if "github.com" in url:
+                # Remove protocol and www
+                url = url.replace("https://", "").replace("http://", "").replace("www.", "")
+                
+                # Parse URL parts
+                parts = url.split("/")
+                if len(parts) >= 3 and parts[0] == "github.com":
+                    owner = parts[1]
+                    repo = parts[2]
+                    
+                    # Extract file path if present
+                    if len(parts) > 4 and parts[3] == "blob":
+                        ref = parts[4]  # branch/commit
+                        path = "/".join(parts[5:]) if len(parts) > 5 else ""
+                        return {"owner": owner, "repo": repo, "path": path, "ref": ref}
+                    else:
+                        return {"owner": owner, "repo": repo, "path": "", "ref": "main"}
+            return None
+        except Exception:
+            return None
+
+
+class GitHubSearchWithContentTool(Tool):
+    """Enhanced GitHub search tool that can fetch actual code content."""
+    
+    def __init__(self, github_token: Optional[str] = None):
+        """Initialize GitHub search tool with content fetching capability."""
+        super().__init__(
+            name="github_search_with_content",
+            description="Search GitHub for code and optionally fetch the actual content",
+            tool_type=ToolType.EXTERNAL
+        )
+        
+        self.github_token = github_token or os.getenv("GITHUB_TOKEN")
+        self.base_url = "https://api.github.com"
+        self.rate_limit_remaining = 60
+        self.rate_limit_reset = time.time()
+        self.content_fetcher = GitHubContentFetcher(github_token)
+        
+        # Setup headers
+        self.headers = {
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "RAG-System-GitHub-Search/1.0"
+        }
+        
+        if self.github_token:
+            self.headers["Authorization"] = f"token {self.github_token}"
+            self.rate_limit_remaining = 5000
+    
+    async def execute(self, query: str, 
+                     search_type: str = "code",
+                     language: Optional[str] = None,
+                     fetch_content: bool = True,
+                     max_content_files: int = 3,
+                     **kwargs) -> ToolResult:
+        """Execute GitHub search and optionally fetch content."""
+        start_time = datetime.now()
+        
+        try:
+            print(f"🔍 GitHub Search with Content - Query: '{query}'")
+            print(f"🔍 Language: {language}, Fetch content: {fetch_content}")
+            
+            # First, perform the search using existing logic
+            search_result = await self._perform_github_search(query, search_type, language, **kwargs)
+            
+            results_with_content = []
+            
+            if search_result.get("items") and fetch_content:
+                print(f"📥 Fetching content for up to {max_content_files} files from {len(search_result['items'])} results...")
+                
+                for i, item in enumerate(search_result["items"][:max_content_files]):
+                    result_data = {
+                        "title": item.get("name", "Unknown"),
+                        "url": item.get("html_url", ""),
+                        "repository": item.get("repository", {}).get("full_name", ""),
+                        "path": item.get("path", ""),
+                        "score": item.get("score", 0.0),
+                        "content": None
+                    }
+                    
+                    # Try to fetch the actual content
+                    if "repository" in item and "path" in item:
+                        repo_info = item["repository"]
+                        owner = repo_info.get("owner", {}).get("login", "")
+                        repo_name = repo_info.get("name", "")
+                        file_path = item.get("path", "")
+                        
+                        if owner and repo_name and file_path:
+                            print(f"📦 Fetching content from {owner}/{repo_name}/{file_path}")
+                            content = await self.content_fetcher.fetch_file_content(
+                                owner, repo_name, file_path
+                            )
+                            
+                            if content:
+                                result_data["content"] = content
+                                print(f"✅ Successfully fetched {len(content)} characters")
+                            else:
+                                print(f"❌ Failed to fetch content")
+                    
+                    results_with_content.append(result_data)
+            
+            execution_time = (datetime.now() - start_time).total_seconds()
+            
+            return ToolResult(
+                tool_name=self.name,
+                success=True,
+                result={
+                    "query": query,
+                    "search_type": search_type,
+                    "total_count": search_result.get("total_count", 0),
+                    "results": results_with_content,
+                    "content_fetched": fetch_content,
+                    "files_with_content": len([r for r in results_with_content if r.get("content")])
+                },
+                execution_time=execution_time,
+                metadata={
+                    "language": language,
+                    "max_content_files": max_content_files
+                }
+            )
+            
+        except Exception as e:
+            execution_time = (datetime.now() - start_time).total_seconds()
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error=f"GitHub search with content failed: {str(e)}",
+                execution_time=execution_time
+            )
+    
+    async def _perform_github_search(self, query: str, search_type: str, 
+                                   language: Optional[str] = None, **kwargs) -> Dict[str, Any]:
+        """Perform GitHub search (reusing existing logic)."""
+        # Build search query
+        search_parts = [query]
+        if language:
+            search_parts.append(f"language:{language}")
+        
+        search_query = " ".join(search_parts)
+        
+        # Perform search
+        async with aiohttp.ClientSession() as session:
+            url = f"{self.base_url}/search/{search_type}"
+            params = {
+                "q": search_query,
+                "sort": kwargs.get("sort", "best-match"),
+                "order": kwargs.get("order", "desc"),
+                "per_page": min(kwargs.get("per_page", 5), 10),  # Limit to avoid rate limits
+                "page": kwargs.get("page", 1)
+            }
+            
+            print(f"🌐 API Request URL: {url}")
+            print(f"🌐 Parameters: {params}")
+            print(f"🌐 Headers: {self.headers}")
+            
+            async with session.get(url, headers=self.headers, params=params) as response:
+                print(f"📊 API Response Status: {response.status}")
+                
+                # Update rate limit info
+                self.rate_limit_remaining = int(response.headers.get("X-RateLimit-Remaining", 0))
+                print(f"📊 Rate Limit Remaining: {self.rate_limit_remaining}")
+                
+                if response.status == 200:
+                    return await response.json()
+                else:
+                    error_text = await response.text()
+                    raise Exception(f"GitHub API error: {response.status} - {error_text}")
+    
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        """Get parameters schema."""
+        return {
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for GitHub code/repositories"
+                },
+                "search_type": {
+                    "type": "string",
+                    "enum": ["code", "repositories"],
+                    "description": "Type of search to perform",
+                    "default": "code"
+                },
+                "language": {
+                    "type": "string",
+                    "description": "Programming language filter"
+                },
+                "fetch_content": {
+                    "type": "boolean",
+                    "description": "Whether to fetch actual file content",
+                    "default": True
+                },
+                "max_content_files": {
+                    "type": "integer",
+                    "description": "Maximum number of files to fetch content for",
+                    "default": 3
+                }
+            },
+            "required": ["query"]
+        }
 
 
 class GitHubSearchTool(Tool):
@@ -455,6 +701,11 @@ def create_github_search_tool(github_token: Optional[str] = None) -> GitHubSearc
 def create_github_code_search_tool(github_token: Optional[str] = None) -> GitHubCodeSearchTool:
     """Create a specialized GitHub code search tool instance."""
     return GitHubCodeSearchTool(github_token)
+
+
+def create_github_search_with_content_tool(github_token: Optional[str] = None) -> GitHubSearchWithContentTool:
+    """Create a GitHub search with content tool instance."""
+    return GitHubSearchWithContentTool(github_token)
 
 
 # Example usage and testing

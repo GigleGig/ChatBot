@@ -20,6 +20,7 @@ import os
 import json
 import uuid
 import asyncio
+import tempfile
 from abc import ABC, abstractmethod
 from typing import List, Dict, Any, Optional, Union, Callable
 from datetime import datetime, timezone
@@ -30,6 +31,7 @@ from pydantic import BaseModel, Field, field_validator
 from config import get_config
 from llm_integration import RAGChain, MessageRole
 from vector_store import DocumentRetriever
+from document_processor import DocumentProcessor
 
 
 class ToolType(str, Enum):
@@ -39,6 +41,7 @@ class ToolType(str, Enum):
     GENERATION = "generation"
     UTILITY = "utility"
     EXTERNAL = "external"
+    KNOWLEDGE = "knowledge"
 
 
 class ToolResult(BaseModel):
@@ -151,6 +154,172 @@ class DocumentSearchTool(Tool):
                 }
             },
             "required": ["query"]
+        }
+
+
+class AddToKnowledgeBaseTool(Tool):
+    """Tool for adding content to the RAG knowledge base."""
+    
+    def __init__(self, vector_store, config=None, document_manager=None):
+        super().__init__(
+            name="add_to_knowledge_base",
+            description="Add content to the RAG knowledge base for future reference",
+            tool_type=ToolType.KNOWLEDGE
+        )
+        self.vector_store = vector_store
+        self.config = config or get_config()
+        self.processor = DocumentProcessor(self.config)
+        self.document_manager = document_manager
+    
+    async def execute(self, content: str, title: str, source: str = "user_input", 
+                     metadata: Optional[Dict[str, Any]] = None) -> ToolResult:
+        """Add content to the knowledge base."""
+        start_time = datetime.now()
+        
+        print(f"🔧 AddToKnowledgeBaseTool: Processing '{title}' ({len(content)} chars)")
+        
+        try:
+            # Create a temporary file with the content
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
+                f.write(content)
+                temp_path = f.name
+            
+            print(f"🔧 Created temp file: {temp_path}")
+            
+            try:
+                # Process the content into chunks
+                print(f"🔧 Processing temp file: {temp_path}")
+                
+                try:
+                    result = self.processor.process_document(temp_path)
+                    chunks = result.get('chunks', [])
+                    print(f"🔧 DocumentProcessor result: success={result is not None}")
+                    print(f"🔧 Chunks found: {len(chunks)}")
+                    
+                    if chunks:
+                        print(f"🔧 First chunk preview: {chunks[0].content[:100]}...")
+                    else:
+                        print(f"🔧 No chunks - checking original content...")
+                        original_content = result.get('original_content', '')
+                        print(f"🔧 Original content length: {len(original_content)}")
+                        if original_content:
+                            print(f"🔧 Original content preview: {original_content[:200]}...")
+                        
+                        # Check if file exists and has content
+                        if os.path.exists(temp_path):
+                            with open(temp_path, 'r', encoding='utf-8') as f:
+                                file_content = f.read()
+                            print(f"🔧 File content length: {len(file_content)}")
+                            print(f"🔧 File content preview: {file_content[:200]}...")
+                            
+                except Exception as process_error:
+                    print(f"🔧 DocumentProcessor error: {str(process_error)}")
+                    print(f"🔧 Checking if temp file exists: {os.path.exists(temp_path)}")
+                    if os.path.exists(temp_path):
+                        print(f"🔧 File size: {os.path.getsize(temp_path)} bytes")
+                        try:
+                            with open(temp_path, 'r', encoding='utf-8') as f:
+                                file_content = f.read()
+                            print(f"🔧 File content: {file_content[:500]}...")
+                        except Exception as read_error:
+                            print(f"🔧 Could not read file: {read_error}")
+                    
+                    # Return error result
+                    return ToolResult(
+                        tool_name=self.name,
+                        success=False,
+                        error=f"DocumentProcessor failed: {str(process_error)}",
+                        execution_time=(datetime.now() - start_time).total_seconds()
+                    )
+                
+                if chunks:
+                    # Update chunk metadata
+                    for chunk in chunks:
+                        chunk.source_document = title
+                        chunk.metadata.update({
+                            "source_type": source,
+                            "added_at": datetime.now().isoformat(),
+                            **(metadata or {})
+                        })
+                    
+                    # Add chunks to vector store
+                    success = self.vector_store.add_documents(chunks)
+                    
+                    if success and self.document_manager:
+                        # Update document manager statistics
+                        self.document_manager.processed_documents.append({
+                            "filename": title,
+                            "path": f"tool:{source}",
+                            "chunks": len(chunks),
+                            "processed_at": datetime.now().isoformat()
+                        })
+                        
+                        self.document_manager.document_stats["total_documents"] += 1
+                        self.document_manager.document_stats["total_chunks"] += len(chunks)
+                        self.document_manager.document_stats["last_updated"] = datetime.now().isoformat()
+                        
+                        print(f"✅ Updated DocumentManager stats: {len(chunks)} chunks added")
+                    
+                    execution_time = (datetime.now() - start_time).total_seconds()
+                    
+                    return ToolResult(
+                        tool_name=self.name,
+                        success=success,
+                        result={
+                            "title": title,
+                            "chunks_added": len(chunks),
+                            "total_characters": len(content),
+                            "source": source,
+                            "stats_updated": self.document_manager is not None
+                        },
+                        execution_time=execution_time,
+                        metadata={"source_type": source}
+                    )
+                else:
+                    return ToolResult(
+                        tool_name=self.name,
+                        success=False,
+                        error="No content could be extracted",
+                        execution_time=0.0
+                    )
+                    
+            finally:
+                # Clean up temporary file
+                os.unlink(temp_path)
+                
+        except Exception as e:
+            execution_time = (datetime.now() - start_time).total_seconds()
+            return ToolResult(
+                tool_name=self.name,
+                success=False,
+                error=str(e),
+                execution_time=execution_time
+            )
+    
+    def _get_parameters_schema(self) -> Dict[str, Any]:
+        """Get parameters schema for adding to knowledge base."""
+        return {
+            "type": "object",
+            "properties": {
+                "content": {
+                    "type": "string",
+                    "description": "Content to add to the knowledge base"
+                },
+                "title": {
+                    "type": "string",
+                    "description": "Title or identifier for the content"
+                },
+                "source": {
+                    "type": "string",
+                    "description": "Source of the content (e.g., 'github', 'user_input')",
+                    "default": "user_input"
+                },
+                "metadata": {
+                    "type": "object",
+                    "description": "Additional metadata to store with the content"
+                }
+            },
+            "required": ["content", "title"]
         }
 
 
@@ -388,6 +557,16 @@ class Agent:
         document_search = DocumentSearchTool(self.rag_chain.retriever)
         self.tool_manager.register_tool(document_search)
         
+        # Knowledge base tool (for adding content to RAG)
+        # We need to pass the document manager to properly update statistics
+        if hasattr(self.rag_chain.retriever, 'vector_store'):
+            knowledge_tool = AddToKnowledgeBaseTool(
+                self.rag_chain.retriever.vector_store, 
+                self.config,
+                document_manager=getattr(self, 'document_manager', None)
+            )
+            self.tool_manager.register_tool(knowledge_tool)
+        
         # Text analysis tool
         text_analysis = TextAnalysisTool()
         self.tool_manager.register_tool(text_analysis)
@@ -397,7 +576,7 @@ class Agent:
         if github_token:
             try:
                 # Dynamic import to avoid circular imports
-                from github_search_tool import create_github_search_tool, create_github_code_search_tool
+                from github_search_tool import create_github_search_tool, create_github_code_search_tool, GitHubSearchWithContentTool
                 
                 # General GitHub search tool
                 github_search_tool = create_github_search_tool(github_token)
@@ -406,6 +585,11 @@ class Agent:
                 # Specialized code search tool
                 github_code_search_tool = create_github_code_search_tool(github_token)
                 self.tool_manager.register_tool(github_code_search_tool)
+                
+                # New GitHub search with content tool
+                github_content_tool = GitHubSearchWithContentTool(github_token)
+                self.tool_manager.register_tool(github_content_tool)
+                
             except ImportError as e:
                 print(f"Warning: Could not import GitHub search tools: {e}")
         else:
@@ -499,27 +683,17 @@ class Agent:
         
         # Check for GitHub/code search keywords
         if any(keyword in user_lower for keyword in keywords_for_github) or any(keyword in user_lower for keyword in keywords_for_code_search):
-            # Determine if it's a general GitHub search or code-specific search
-            if any(keyword in user_lower for keyword in keywords_for_code_search):
-                # Use specialized code search
-                recommended_tools.append({
-                    "tool_name": "github_code_search",
-                    "parameters": {
-                        "query": user_input,
-                        "language": self._detect_programming_language(user_input),
-                        "per_page": 5
-                    }
-                })
-            else:
-                # Use general GitHub search
-                recommended_tools.append({
-                    "tool_name": "github_search",
-                    "parameters": {
-                        "query": user_input,
-                        "search_type": "repositories" if "repo" in user_lower else "code",
-                        "per_page": 5
-                    }
-                })
+            # Use the new GitHub search with content tool for better results
+            recommended_tools.append({
+                "tool_name": "github_search_with_content",
+                "parameters": {
+                    "query": user_input,
+                    "search_type": "code",
+                    "language": self._detect_programming_language(user_input),
+                    "fetch_content": True,
+                    "max_content_files": 3
+                }
+            })
         
         # Check for document search keywords (but not if GitHub search is already selected)
         elif any(keyword in user_lower for keyword in keywords_for_search):
@@ -618,6 +792,57 @@ class Agent:
                             f"Description: {description[:150]}...\n"
                             f"URL: {url}"
                         )
+                
+                elif result.tool_name == "github_search_with_content" and result.result:
+                    github_results = result.result.get("results", [])
+                    total_count = result.result.get("total_count", 0)
+                    files_with_content = result.result.get("files_with_content", 0)
+                    
+                    tool_context_parts.append(f"GitHub Search with Content: Found {total_count} total results, fetched content from {files_with_content} files")
+                    
+                    # Process results and add content to knowledge base
+                    for i, github_result in enumerate(github_results[:3], 1):
+                        title = github_result.get("title", "Unknown")
+                        repository = github_result.get("repository", "Unknown repo")
+                        url = github_result.get("url", "")
+                        content = github_result.get("content")
+                        
+                        if content:
+                            # Add content to knowledge base
+                            print(f"📝 Found content ({len(content)} chars) from {repository}/{title}, adding to knowledge base...")
+                            try:
+                                add_result = await self.tool_manager.execute_tool(
+                                    "add_to_knowledge_base",
+                                    content=content,
+                                    title=f"GitHub: {repository}/{title}",
+                                    source="github",
+                                    metadata={
+                                        "repository": repository,
+                                        "url": url,
+                                        "language": self._detect_programming_language(content),
+                                        "search_query": user_input
+                                    }
+                                )
+                                
+                                if add_result.success:
+                                    chunks_added = add_result.result.get('chunks_added', 0)
+                                    print(f"✅ Added GitHub content to knowledge base: {repository}/{title} ({chunks_added} chunks)")
+                                else:
+                                    print(f"❌ Failed to add to knowledge base: {add_result.error}")
+                                    
+                            except Exception as e:
+                                print(f"❌ Error adding to knowledge base: {str(e)}")
+                        else:
+                            print(f"⚠️  No content found for {repository}/{title}")
+                        
+                        # Add to tool context for immediate use
+                        content_preview = content[:500] + "..." if content and len(content) > 500 else content or "No content available"
+                        tool_context_parts.append(
+                            f"GitHub Result {i}: {title}\n"
+                            f"Repository: {repository}\n"
+                            f"URL: {url}\n"
+                            f"Content: {content_preview}"
+                        )
         
         tool_context = "\n\n".join(tool_context_parts) if tool_context_parts else "No tool results available."
         
@@ -688,12 +913,13 @@ Please provide a comprehensive response that combines insights from both the kno
                 }
     
     async def _generate_simple_response(self, user_input: str) -> Dict[str, Any]:
-        """Generate simple response without tools."""
+        """Generate simple response without tools but still use RAG."""
+        # Always try RAG first to get relevant documents from knowledge base
         rag_result = self.rag_chain.process_query(
             user_input,
             conversation_id=self.conversation_id,
-            template_name="chat",
-            retrieval_k=3
+            template_name="rag_qa",
+            retrieval_k=5
         )
         
         if rag_result["success"]:
@@ -703,11 +929,36 @@ Please provide a comprehensive response that combines insights from both the kno
                 "rag_results": rag_result.get("retrieval_results", [])
             }
         else:
-            return {
-                "response": f"I encountered an issue: {rag_result.get('error', 'Unknown error')}",
-                "tools_used": [],
-                "error": rag_result.get("error")
-            }
+            # If RAG fails, generate a response using LLM without context
+            # This ensures we always provide a helpful response
+            try:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": """You are a helpful AI assistant. The user has asked a question but no relevant documents were found in the knowledge base. Please provide a helpful response based on your general knowledge. If the question is about programming, provide code examples. If you don't know something specific, be honest about limitations but still try to be helpful with general guidance."""
+                    },
+                    {
+                        "role": "user",
+                        "content": user_input
+                    }
+                ]
+                
+                llm_response = self.rag_chain.llm_manager.generate_response(messages)
+                
+                return {
+                    "response": llm_response.content,
+                    "tools_used": [],
+                    "rag_results": [],
+                    "fallback_response": True
+                }
+                
+            except Exception as e:
+                return {
+                    "response": f"I apologize, but I encountered an issue generating a response. Please try rephrasing your question or adding more context. Error: {str(e)}",
+                    "tools_used": [],
+                    "error": str(e),
+                    "fallback_response": True
+                }
     
     def get_agent_status(self) -> Dict[str, Any]:
         """Get current agent status and statistics."""

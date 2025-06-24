@@ -296,6 +296,12 @@ class RAGApplication:
             print("🎯 Setting up intelligent agent...")
             self.agent = create_agent(rag_chain, self.config)
             
+            # Connect agent to document manager for proper statistics tracking
+            self.agent.document_manager = self.document_manager
+            
+            # Re-register tools now that we have the document manager
+            self.agent._register_default_tools()
+            
             # Initialize workflow manager
             print("🌊 Setting up workflow management...")
             self.workflow_manager = AgentWorkflow(self.agent)
