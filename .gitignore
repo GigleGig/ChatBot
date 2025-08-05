@@ -110,4 +110,16 @@ NOTES.md
 notes.md
 
 # Project specific
-vector_store/ 
+vector_store/
+
+# Django specific
+django_app/.env
+django_app/db.sqlite3
+django_app/media/
+django_app/staticfiles/
+
+# Frontend specific  
+frontend/node_modules/
+frontend/build/
+frontend/dist/
+frontend/.env 
